@@ -1,8 +1,5 @@
 import argparse
-import os
 import numpy as np
-import math
-import sys
 import itertools
 import datetime
 import time
@@ -14,12 +11,10 @@ from torch.utils.data import DataLoader
 from torchvision import datasets
 from torch.autograd import Variable
 
-from model import *
-from dataset import *
-from utils import *
+from model import ResNet, Discriminator
+from dataset import Data
+from utils import ReplayBuffer, LambdaLR, weights_init_normal
 
-import torch.nn as nn
-import torch.nn.functional as F
 import torch
 
 os.makedirs('images', exist_ok=True)
@@ -43,17 +38,17 @@ parser.add_argument('--checkpoint_interval', type=int, default=-1, help='interva
 opt = parser.parse_args()
 print(opt)
 
-# Losses
-criterion_GAN = torch.nn.MSELoss()
-criterion_cycle = torch.nn.L1Loss()
-criterion_identity = torch.nn.L1Loss()
+# Loss
+criterion_GAN = torch.nn.MSELoss() # gan loss
+criterion_cycle = torch.nn.L1Loss() # shape loss for x&X y&Y
+criterion_identity = torch.nn.L1Loss() # shape loss for X'&DX() Y'&DY()
 
 cuda = True if torch.cuda.is_available() else False
 
-# Calculate output of image discriminator (PatchGAN)
+# Patch size for discriminator(PatchGAN)
 patch = (1, opt.img_height // 2**4, opt.img_width // 2**4)
 
-# Initialize generator and discriminator
+# Init
 G_XY = ResNet()
 G_YX = ResNet()
 D_X = Discriminator()
@@ -71,13 +66,13 @@ if cuda:
     criterion_identity.cuda()
 
 if opt.epoch != 0:
-    # Load pretrained models
+    # load par
     G_XY.load_state_dict(torch.load('saved_models/G_XY_%d.pth'))
     G_YX.load_state_dict(torch.load('saved_models/G_YX_%d.pth'))
     D_X.load_state_dict(torch.load('saved_models/D_X_%d.pth'))
     D_Y.load_state_dict(torch.load('saved_models/D_Y_%d.pth'))
 else:
-    # Initialize weights
+    # or init
     G_XY.apply(weights_init_normal)
     G_YX.apply(weights_init_normal)
     D_X.apply(weights_init_normal)
@@ -87,13 +82,13 @@ else:
 lambda_cyc = 10
 lambda_id = 0.5 * lambda_cyc
 
-# Optimizers
+# Optimizer
 optimizer_G = torch.optim.Adam(itertools.chain(G_XY.parameters(), G_YX.parameters()),
                                 lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_D_X = torch.optim.Adam(D_X.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_D_Y = torch.optim.Adam(D_Y.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 
-# Learning rate update schedulers
+# Learning rate update
 lr_scheduler_G = torch.optim.lr_scheduler.LambdaLR(optimizer_G, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step)
 lr_scheduler_D_X = torch.optim.lr_scheduler.LambdaLR(optimizer_D_X, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step)
 lr_scheduler_D_Y = torch.optim.lr_scheduler.LambdaLR(optimizer_D_Y, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step)
@@ -130,15 +125,11 @@ def sample_images(batches_done):
                             real_Y.data, fake_X.data), 0)
     save_image(img_sample, 'images/%s.png' % batches_done, nrow=5, normalize=True)
 
-# ----------
-#  Training
-# ----------
-
+# train
 start_time = time.time()
 for epoch in range(opt.epoch, opt.n_epochs):
     for i, batch in enumerate(dataloader):
 
-        # Set model input
         real_X = Variable(batch['X'].type(Tensor))
         real_Y = Variable(batch['Y'].type(Tensor))
 
@@ -146,46 +137,40 @@ for epoch in range(opt.epoch, opt.n_epochs):
         valid = Variable(Tensor(np.ones((real_X.size(0), *patch))), requires_grad=False)
         fake = Variable(Tensor(np.zeros((real_X.size(0), *patch))), requires_grad=False)
 
-        # ------------------
-        #  Train Generators
-        # ------------------
-
+        # Train G
         optimizer_G.zero_grad()
 
         # Identity loss
-        loss_id_X = criterion_identity(G_YX(real_X), real_X)
-        loss_id_Y = criterion_identity(G_XY(real_Y), real_Y)
+        loss_id_X = criterion_identity(G_YX(real_X), real_X) # L1 norm(X, X')
+        loss_id_Y = criterion_identity(G_XY(real_Y), real_Y) # L1 norm(Y, Y')
 
         loss_identity = (loss_id_X + loss_id_Y) / 2
 
         # GAN loss
-        fake_Y = G_XY(real_X)
-        loss_GAN_XY = criterion_GAN(D_Y(fake_Y), valid)
-        fake_X = G_YX(real_Y)
-        loss_GAN_YX = criterion_GAN(D_X(fake_X), valid)
+        fake_Y = G_XY(real_X) # Y' = G(X)
+        loss_GAN_XY = criterion_GAN(D_Y(fake_Y), valid) # identify Y'
+        fake_X = G_YX(real_Y) # X' = F(Y)
+        loss_GAN_YX = criterion_GAN(D_X(fake_X), valid) # identify X'
 
         loss_GAN = (loss_GAN_XY + loss_GAN_YX) / 2
 
         # Cycle loss
-        recov_X = G_YX(fake_Y)
-        loss_cycle_X = criterion_cycle(recov_X, real_X)
-        recov_Y = G_XY(fake_X)
-        loss_cycle_Y = criterion_cycle(recov_Y, real_Y)
+        recov_X = G_YX(fake_Y) # x = F(Y') = F(G(X))
+        loss_cycle_X = criterion_cycle(recov_X, real_X) # x-X
+        recov_Y = G_XY(fake_X) # y = G(X') = G(F(Y))
+        loss_cycle_Y = criterion_cycle(recov_Y, real_Y) # y-Y
 
         loss_cycle = (loss_cycle_X + loss_cycle_Y) / 2
 
         # Total loss
-        loss_G =    loss_GAN + \
-                    lambda_cyc * loss_cycle + \
-                    lambda_id * loss_identity
+        loss_G = loss_GAN + lambda_cyc * loss_cycle + lambda_id * loss_identity
 
         loss_G.backward()
         optimizer_G.step()
 
-        # -----------------------
-        #  Train Discriminator X
-        # -----------------------
-
+        # ====================================================        
+        
+        # Train DX
         optimizer_D_X.zero_grad()
 
         # Real loss
@@ -199,10 +184,9 @@ for epoch in range(opt.epoch, opt.n_epochs):
         loss_D_X.backward()
         optimizer_D_X.step()
 
-        # -----------------------
-        #  Train Discriminator B
-        # -----------------------
-
+        # ====================================================
+        
+        # Train DY
         optimizer_D_Y.zero_grad()
 
         # Real loss
@@ -218,10 +202,9 @@ for epoch in range(opt.epoch, opt.n_epochs):
 
         loss_D = (loss_D_X + loss_D_Y) / 2
 
-        # --------------
-        #  Log Progress
-        # --------------
+        # ====================================================
 
+        # Log progress
         # Determine approximate time left
         batches_done = epoch * len(dataloader) + i
         batches_left = opt.n_epochs * len(dataloader) - batches_done
