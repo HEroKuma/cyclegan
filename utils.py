@@ -3,9 +3,9 @@ import random
 from torch.autograd import Variable
 import torch
 
+# make fake img buffer
 class ReplayBuffer():
     def __init__(self, max_size=50):
-        assert (max_size > 0), "Empty buffer or trying to create a black hole"
         self.max_size = max_size
         self.data = []
 
