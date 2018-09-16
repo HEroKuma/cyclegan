@@ -11,6 +11,7 @@ import torchvision.transforms as transforms
 from torchvision.utils import save_image
 
 from torch.utils.data import DataLoader
+from tensorboardX import SummaryWriter
 from torchvision import datasets
 from torch.autograd import Variable
 
@@ -18,8 +19,6 @@ from model import *
 from dataset import *
 from utils import *
 
-import torch.nn as nn
-import torch.nn.functional as F
 import torch
 
 os.makedirs('images', exist_ok=True)
@@ -40,8 +39,15 @@ parser.add_argument('--img_width', type=int, default=256, help='size of image wi
 parser.add_argument('--channels', type=int, default=3, help='number of image channels')
 parser.add_argument('--sample_interval', type=int, default=100, help='interval between sampling images from generators')
 parser.add_argument('--checkpoint_interval', type=int, default=-1, help='interval between saving model checkpoints')
+parser.add_argument('--gpu_num', type=str, default='1', help='number of gpu device')
+parser.add_argument('--log_file', type=str, default='log', help='log file saved path')
+parser.add_argument('--tfboard', type=bool, default=True, help='use tensorboard or not')
 opt = parser.parse_args()
 print(opt)
+
+os.environ["CUDA_VISIBLE_DEVICES"]=opt.gpu_num
+tf_iter = 0
+log_size = 100
 
 # Losses
 criterion_GAN = torch.nn.MSELoss()
@@ -117,6 +123,16 @@ dataloader = DataLoader(Data(os.path.join(root, opt.dataset_name), transforms_=t
 # Test data loader
 val_dataloader = DataLoader(Data(os.path.join(root, opt.dataset_name), transforms_=transforms_, unaligned=True, mode='test'),
                         batch_size=5, shuffle=True, num_workers=1)
+# TFboard data loader
+test_loader = DataLoader(Data(os.path.join(root, opt.dataset_name), transforms_=transforms_, unaligned=True, mode='test'),
+                        batch_size=1, shuffle=True, num_workers=1)
+
+
+# def loss_tfboard(data_loader, writer: SummaryWriter = None, epoch=None):
+#     X = next(iter(data_loader))['X']
+#     Y = next(iter(data_loader))['Y']
+#
+#     if epoch == 0:
 
 
 def sample_images(batches_done):
@@ -128,13 +144,23 @@ def sample_images(batches_done):
     fake_X = G_YX(real_Y)
     img_sample = torch.cat((real_X.data, fake_Y.data,
                             real_Y.data, fake_X.data), 0)
-    save_image(img_sample, 'images/%s.png' % batches_done, nrow=5, normalize=True)
+    save_image(img_sample, '/mnt/nas/herokuma/cycle_gan_dataset/gen_img/%s.png' % batches_done, nrow=5, normalize=True)
 
 # ----------
 #  Training
 # ----------
 
 start_time = time.time()
+if opt.tfboard:
+    writer_G = SummaryWriter('log/G')
+    writer_D_X = SummaryWriter('log/D/X')
+    writer_D_Y = SummaryWriter('log/D/Y')
+else:
+    writer_G = None
+    writer_D_X = None
+    writer_D_Y = None
+
+
 for epoch in range(opt.epoch, opt.n_epochs):
     for i, batch in enumerate(dataloader):
 
@@ -181,7 +207,19 @@ for epoch in range(opt.epoch, opt.n_epochs):
 
         loss_G.backward()
         optimizer_G.step()
-
+        if i % log_size == 0:
+            G_loss_info = {
+                'identity_loss_X': loss_id_X,
+                'identity_loss_Y': loss_id_Y,
+                'identity_loss': loss_identity,
+                'GAN_loss_XY': loss_GAN_XY,
+                'GAN_loss_YX': loss_GAN_YX,
+                'GAN_loss': loss_GAN,
+                'cycle_loss_X': loss_cycle_X,
+                'cycle_loss_Y': loss_cycle_Y,
+                'cycle_loss': loss_cycle,
+                'total_loss': loss_G,
+            }
         # -----------------------
         #  Train Discriminator X
         # -----------------------
@@ -199,8 +237,14 @@ for epoch in range(opt.epoch, opt.n_epochs):
         loss_D_X.backward()
         optimizer_D_X.step()
 
+        if i % log_size == 0:
+            D_X_info = {
+                'real_loss' : loss_real,
+                'fake_loss' : loss_fake,
+                'D_X_loss' : loss_D_X,
+            }
         # -----------------------
-        #  Train Discriminator B
+        #  Train Discriminator Y
         # -----------------------
 
         optimizer_D_Y.zero_grad()
@@ -218,6 +262,31 @@ for epoch in range(opt.epoch, opt.n_epochs):
 
         loss_D = (loss_D_X + loss_D_Y) / 2
 
+        if i % log_size == 0:
+            D_Y_info = {
+                'real_loss': loss_real,
+                'fake_loss': loss_fake,
+                'D_Y_loss': loss_D_Y,
+            }
+        # --------------
+        #  Add loss log to TFboard
+        # --------------
+        if i % log_size == 0:
+            if writer_G and writer_D_X and writer_D_Y:
+                tf_iter
+                for key, value in G_loss_info.items():
+                    writer_G.add_scalar(key, value.item(), tf_iter)
+
+                for key, value in D_X_info.items():
+                    writer_D_X.add_scalar(key, value.item(), tf_iter)
+
+                for key, value in D_Y_info.items():
+                    writer_D_Y.add_scalar(key, value.item(), tf_iter)
+                tf_iter += 1
+
+        # if writer:
+        #     loss_tfboard(test_loader, writer, epoch)
+
         # --------------
         #  Log Progress
         # --------------
@@ -228,7 +297,7 @@ for epoch in range(opt.epoch, opt.n_epochs):
         time_left = datetime.timedelta(seconds=batches_left * (time.time() - start_time)/ (batches_done + 1))
 
         # Print log
-        sys.stdout.write("\r[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f, adv: %f, cycle: %f, identity: %f] ETA: %s" %
+        print("\r[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f, adv: %f, cycle: %f, identity: %f] ETA: %s" %
                                                         (epoch, opt.n_epochs,
                                                         i, len(dataloader),
                                                         loss_D.item(), loss_G.item(),
@@ -236,8 +305,10 @@ for epoch in range(opt.epoch, opt.n_epochs):
                                                         loss_identity.item(), time_left))
 
         # If at sample interval save image
-        if batches_done % opt.sample_interval == 0:
-            sample_images(batches_done)
+        #if batches_done % opt.sample_interval == 0:
+         #   writer.add_scalar('loss', )
+        #     sample_images(batches_done)
+        sample_images(epoch)
 
 
     # Update learning rates
